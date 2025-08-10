@@ -1,0 +1,163 @@
+using Cysharp.Threading.Tasks;
+using Nethereum.Web3;
+using Reown.AppKit.Unity;
+using Reown.Sign.Unity;
+using System;
+using System.Numerics;
+using UnityEngine;
+using Wallet = Reown.AppKit.Unity.Model.Wallet;
+
+public class WalletManager
+{
+    private Reown.AppKit.Unity.Model.Wallet _wallet;
+    private WalletConnectConnectionProposal _connectionProposal;
+
+    public string Address { get; set; } = string.Empty;
+
+    private bool _isInit = false;
+    public async UniTask<bool> InitTask()
+    {
+        var config = new AppKitConfig(projectId: "",
+                new Metadata(
+                    name: "",
+                    description: "",
+                    url: "https://example.com",
+                    iconUrl: "https://example.com/logo.png"));
+        await AppKit.InitializeAsync(config);
+
+        _wallet = new Wallet()
+        {
+            Id = "c57ca95b47569778a828d19178114f4db188b89b763c899ba0be274e97267d96",
+            Name = "MetaMask",
+            Homepage = "https://metamask.io/",
+            //ImageId = "5195e9db-94d8-4579-6f11-ef553be95100",
+            //ImageId = "eebe4a7f-7166-402f-92e0-1f64ca2aa800",
+            WebappLink = "",
+            MobileLink = "metamask://",
+            AppStore = "https://apps.apple.com/us/app/metamask/id1438144202",
+            PlayStore = "https://play.google.com/store/apps/details?id=io.metamask"
+        };
+
+        Debug.Log("Wallet 초기화 완료");
+
+        _isInit = true;
+
+        return true;
+    }
+
+    public async UniTask<string> OpenDeepLink()
+    {
+        Debug.Log("OpenDeepLinkStart");
+
+        if (!_isInit)
+        {
+            await InitTask();
+        }
+
+        try
+        {
+            await AppKitCore.ConnectAsync(_wallet);
+
+            Debug.Log("Connected to wallet");
+            Debug.Log($"Account: {AppKitCore.Account.Address}");
+
+            Address = AppKitCore.Account.Address;
+
+            return Address;
+        }
+        catch (Exception e)
+        {
+            Debug.LogError($"Failed to connect to wallet: {e.Message}");
+            Managers.UIManager.OpenPopup<Popup_Notice>().OnPopup("NotConnectWallet").Forget();
+            return string.Empty;
+        }
+    }
+
+    public async UniTask GetBalance()
+    {
+        const string contractAddress = "";
+        const string ownerAddress = "";
+        const string abi = "..."; // ABI of the ERC20 token contract
+
+        var evm = AppKit.Evm;
+        var balance = await evm.ReadContractAsync<BigInteger>(contractAddress, abi, "balanceOf", new object[]
+        {
+        ownerAddress
+        });
+        var decimals = await evm.ReadContractAsync<BigInteger>(contractAddress, abi, "decimals");
+
+        //var finalBalance = tokenBalance / BigInteger.Pow(10, tokenDecimal);
+    }
+
+    public async UniTask<BigInteger> GetEth()
+    {
+        BigInteger balance = await AppKit.Evm.GetBalanceAsync(AppKitCore.Account.Address);
+
+        Debug.Log($"Eth Balance: {Web3.Convert.FromWei(balance)} ETH");
+
+        return balance;
+    }
+
+    public async UniTask<decimal> GetTokenBalance()
+    {
+        if (string.IsNullOrEmpty(Address))
+        {
+            return 0;
+        }
+
+        const string contractAddress = "";
+        const string abi = ""; // ABI of the ERC20 token contract
+
+        var evm = AppKit.Evm;
+        var balance = await evm.ReadContractAsync<BigInteger>(contractAddress, abi, "balanceOf", new object[]
+        {
+    Address
+        });
+
+        //Debug.Log($"Token Balance: {Web3.Convert.FromWei(balance)} Token");
+
+        return Web3.Convert.FromWei(balance);
+    }
+
+    public async UniTask<bool> Transfer(int price)
+    {
+        Debug.Log("Transfer Start");
+
+        if (!AppKitCore.IsAccountConnected)
+            await OpenDeepLink();
+
+        const string contractAddress = "";
+        const string recipientAddress = "";
+        const string abi = ""; // ABI of the ERC20 token contract
+
+        var amount = Web3.Convert.ToWei(price);
+        Debug.Log($"Transfer amount: {amount} wei");
+
+        // Arguments for the transfer method. The order of the arguments must match the order in the method signature.
+        // Method signature: `function transfer(address _to, uint256 _value) public returns (bool success)`
+        var arguments = new object[]
+        {
+    recipientAddress,
+    amount
+        };
+
+        // Estimate gas amount
+        var gasAmount = await AppKit.Evm.EstimateGasAsync(contractAddress, abi, "transfer", arguments: arguments);
+        Debug.Log($"Estimated gas amount: {gasAmount}");
+
+        try
+        {
+
+            // Send transaction
+            var result = await AppKit.Evm.WriteContractAsync(contractAddress, abi, "transfer", gasAmount, arguments);
+            Debug.Log($"Transaction result: {result}");
+            return true;
+        }
+        catch (Exception e)
+        {
+            Debug.Log($"Transaction failed: {e.Message}");
+            return false;
+        }
+
+    }
+}
