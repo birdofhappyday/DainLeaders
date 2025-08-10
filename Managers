@@ -1,0 +1,159 @@
+using Cysharp.Threading.Tasks;
+using Facebook.Unity;
+using Nethereum.Contracts.Standards.ERC20.TokenList;
+using System.Collections;
+using System.Collections.Generic;
+using UnityEngine;
+
+public class Managers : MonoBehaviour
+{
+    public static Managers Instance { get; private set; }
+
+    public static GameObject Root { get; private set; }
+    private const string _name = "@Managers";
+
+    public bool IsInitialize { get; private set; }
+
+    #region System
+
+    public static TableManager TableMgr
+    {
+        get => Instance._tableMgr;
+    }
+
+    public static UIManager UIManager
+    {
+        get => Instance.uiMgr;
+    }
+
+    public static AddressableManager AddressalbeMgr
+    {
+        get => Instance._addresssMgr;
+    }
+
+    public static WalletManager WalletMgr
+    {
+        get => Instance._walletMgr;
+    }
+
+    public static TokenManager TokenMgr
+    {
+        get => Instance._tokenMgr;
+    }
+
+    public static AdManager AdMgr
+    {
+        get => Instance._adMgr;
+    }
+
+    public static RouletteManager RouletteMgr
+    {
+        get => Instance._rouletteMgr;
+    }
+
+    public static FurnitureManager FurnitureMgr
+    {
+        get => Instance._furnitureMgr;
+    }
+
+    public static EventManager EventMgr
+    {
+        get => Instance._eventMgr;
+    }
+
+    public static NoticeManager NoticeMgr
+    {
+        get => Instance._noticeMgr;
+    }
+
+    public static UserDataManager UserDataMgr
+    {
+        get => Instance._userDataMgr;
+    }
+
+    private readonly TableManager _tableMgr = new();
+    private readonly AddressableManager _addresssMgr = new();
+    private readonly UIManager uiMgr = new();
+    private readonly WalletManager _walletMgr = new();
+    private readonly TokenManager _tokenMgr = new();
+    private readonly AdManager _adMgr = new();
+    private readonly RouletteManager _rouletteMgr = new();
+    private readonly FurnitureManager _furnitureMgr = new();
+    private readonly EventManager _eventMgr = new();
+    private readonly NoticeManager _noticeMgr = new();
+    private readonly UserDataManager _userDataMgr = new();
+
+    #endregion
+
+    public static async UniTask<bool> InitTask(bool isForceInit = false)
+    {
+        if (false == isForceInit) 
+        {
+            if (Instance is not null)
+            {
+                return true;
+            }
+        }
+
+        Debug.Log("Managers Init");
+        // 화면 꺼짐 방지
+        Screen.sleepTimeout = SleepTimeout.NeverSleep;
+
+        //RequestIgnoreBatteryOptimizations.Check();
+
+        Root = GameObject.Find(_name);
+        if (null == Root)
+        {
+            Root = new GameObject { name = _name };
+            Root.AddComponent<Managers>();
+        }
+
+        DontDestroyOnLoad(Root);
+
+        Instance = Root.GetComponent<Managers>();
+
+#if !UNITY_STANDALONE_WIN
+        Debug.Log("Facebook SDK 초기화 시작...");
+        // 간단한 초기화
+        FB.Init(() =>
+        {
+            Debug.Log("Facebook SDK 초기화 완료");
+            Debug.Log("초기화 상태: " + (FB.IsInitialized ? "성공" : "실패"));
+        });
+        await WalletMgr.InitTask();
+        Debug.Log("WalletMgr InitTask");
+        //AdMgr.Init();
+#endif
+        await TableMgr.InitTask();
+        Debug.Log("TableMgr InitTask");
+        await AddressalbeMgr.InitTask();
+        Debug.Log("AddressalbeMgr InitTask");
+        await UIManager.InitTask();
+        Debug.Log("UIManager InitTask");
+        await RouletteMgr.InitTask();
+        Debug.Log("RouletteMgr InitTask");
+        EventMgr.Init();
+        Debug.Log("EventMgr.Init()");
+        NoticeMgr.Init();
+        Debug.Log("NoticeMgr.Init()");
+
+        // 원래대로 복원
+        Screen.sleepTimeout = SleepTimeout.SystemSetting;
+        Instance.IsInitialize = true;
+
+        return true;
+    }
+
+    public static void Clear()
+    {
+        if (Instance == null)
+        {
+            return;
+        }
+
+        TokenMgr.Clear();
+        Instance.IsInitialize = false;
+        Destroy(Root);
+        Root = null;
+    }
+}
