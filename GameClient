@@ -1,0 +1,450 @@
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.Net;
+using System.Net.Sockets;
+using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
+using UnityEngine;
+using UnityEngine.SceneManagement;
+using PimDeWitte.UnityMainThreadDispatcher;
+using UnityEngine.Rendering.UI;
+using UnityEngine.AddressableAssets;
+using Cysharp.Threading.Tasks;
+using System.IO;
+using System.Buffers.Binary;
+using UniRx;
+
+public class GameClient
+{
+    //Data save 
+    public byte[] Buffer = new byte[ClientSocket.PACKET_MAX_SIZE];
+    //tcpClient
+    public TcpClient tcpClient;
+    public NetworkStream stream;
+    //MyNetworkManager
+    public MyNetworkManager myNetworkManager;
+    //sceneManager
+    public ISceneManager sceneManager;
+    //LockObj
+    public object lockObj = new object();
+    public object handlerLockObj = new object();
+    //Duplication login check
+    public bool isDuplication = false;
+    //user data
+    public string id;
+    public string pw;
+    public string fcmToken;
+    public string nick;
+    public string context;
+    public string tsId;
+    public string div;
+    public bool isAvatarMaked;
+    public string csId;
+    public ReactiveProperty<int> sp = new();
+    public ReactiveProperty<int> candy = new();
+    //user data over
+    //unity to C#serv check complete result
+    public bool isOk = false;
+    //receive data Task cancelToken
+    public CancellationTokenSource cancellationTokenSource = new CancellationTokenSource();
+    private CancellationToken cancellationToken;
+    // before scene Name
+    public string beforeSceneName;
+    //씬 로딩 저장용 데이터
+    public string loadSceneName = "none";
+    public bool isDelete = false;
+    // 공지사항 자동 오픈 bool변수
+    public bool auto = true;
+    public GameClient(MyNetworkManager manager, bool reconnect = false)
+    {
+        this.myNetworkManager = manager;
+
+        //stream?.Dispose();
+        //tcpClient?.Dispose();
+        //tcpClient?.Close();
+        tcpClient = new TcpClient();
+        Reconnecting = reconnect;
+        if (manager.GetConnectIP() == ConnectIP.IDC_RELEASE)
+        {
+            ConnectAsync(ClientSocket.IP, ClientSocket.ReleasePort).ContinueWith(task =>
+            {
+                if (task.IsFaulted)
+                {
+                    Debug.LogError("Connect Fail: " + task.Exception.GetBaseException().Message);
+                    ClientSocket.instance = null;
+                }
+            });
+        }
+        else if (manager.GetConnectIP() == ConnectIP.IDC_VETNAM)
+        {
+            ConnectAsync(ClientSocket.IP, ClientSocket.ReleaseVN).ContinueWith(task =>
+            {
+                if (task.IsFaulted)
+                {
+                    Debug.LogError("Connect Fail: " + task.Exception.GetBaseException().Message);
+                    ClientSocket.instance = null;
+                }
+            });
+        }
+        else
+        {
+            ConnectAsync(ClientSocket.IP, ClientSocket.DebugPort).ContinueWith(task =>
+            {
+                if (task.IsFaulted)
+                {
+                    Debug.LogError("Connect Fail: " + task.Exception.GetBaseException().Message);
+                    ClientSocket.instance = null;
+                }
+            });
+        }
+        //ConnectAsync(ClientSocket.IP, ClientSocket.ReleaseVN).ContinueWith(task =>
+        //{
+        //    if (task.IsFaulted)
+        //    {
+        //        Debug.LogError("Connect Fail: " + task.Exception.GetBaseException().Message);
+        //        ClientSocket.instance = null;
+        //    }
+        //});
+    }
+
+    public bool Reconnecting = false;
+    /// <summary>
+    /// 비동기적으로 서버에 연결
+    /// </summary>
+    private async Task ConnectAsync(string ip, int port)
+    {
+        try
+        {
+            await tcpClient.ConnectAsync(IPAddress.Parse(ip), port);
+            stream = tcpClient.GetStream();
+
+            if (Reconnecting)
+            {
+                string messageToSend = "Reconnect CREALProject";
+                byte[] dataToSend = Encoding.UTF8.GetBytes(messageToSend);
+
+                await stream.WriteAsync(dataToSend, 0, dataToSend.Length);
+
+                var pUtil = new PacketUtil(SendHandler.ReconnectRequest);
+                pUtil.SetString(PlayerPrefs.GetString("loginDiv"));
+                pUtil.SetString(PlayerPrefs.GetString("ID"));
+                pUtil.SetString(SceneManager.GetActiveScene().name);
+
+                dataToSend = pUtil.GetSendData();
+
+                await stream.WriteAsync(dataToSend, 0, dataToSend.Length);
+
+                LoginEnd().Forget();
+            }
+            else
+            {
+                string messageToSend = "CREALProject";
+                byte[] dataToSend = Encoding.UTF8.GetBytes(messageToSend);
+
+                await stream.WriteAsync(dataToSend, 0, dataToSend.Length);
+
+                LoginEnd().Forget();
+
+                myNetworkManager.SetReconnectEnable(false);
+            }
+        }
+        catch (Exception ex)
+        {
+            Debug.LogError("Connect Fail: " + ex.Message);
+            ClientSocket.instance = null;
+        }
+    }
+
+    public async UniTask LoginEnd()
+    {
+        isOk = true;
+
+        WillThreadCall().Forget();
+        await StartReadingAsync(); // 비동기 읽기 시작
+
+        myNetworkManager.IsServerStarted = true;
+
+        Reconnecting = false;
+    }
+
+    async Task FirstCallBack(IAsyncResult result)
+    {
+        try
+        {
+            // 데이터 전송 성공
+            stream.EndWrite(result);
+            isOk = true;
+            //UnityMainThreadDispatcher.Instance().Enqueue(WillThreadCall());
+
+            WillThreadCall().Forget();
+
+            await StartReadingAsync(); // 비동기 읽기 시작
+        }
+        catch (Exception ex)
+        {
+            Debug.LogError("HandShake Data Send Fail: " + ex.Message);
+        }
+    }
+
+    private async UniTask WillThreadCall()
+    {
+
+        if (SceneManager.GetActiveScene().name == "InitializeScene")
+            await Addressables.LoadSceneAsync(Globals.SceneName.LoginScene);
+
+
+        //yield return null;
+
+    }
+
+
+    void SendCallBack(IAsyncResult result)
+    {
+        try
+        {
+            //data send success
+            stream.EndWrite(result);
+        }
+        catch (Exception ex)
+        {
+            //MyNetworkManager.instance.SpawnErrorPrefab("ErrorPopup_Text002");
+            MyNetworkManager.instance.SpawnErrorPrefab("ErrorPopup_Text002").Forget();
+            Debug.LogError($"Data Send Fail : {ex.Message}");
+        }
+    }
+
+    //private async Task StartReadingAsync()
+    //{
+    //    cancellationToken = cancellationTokenSource.Token;
+
+    //    try
+    //    {
+    //        while (!cancellationToken.IsCancellationRequested)
+    //        {
+    //            int bytesRead = await stream.ReadAsync(Buffer, 0, Buffer.Length, cancellationToken);
+
+    //            if (bytesRead == 0) break; // 소켓 정상 종료
+
+    //            await ProcessPacketAsync(bytesRead);
+    //        }
+    //    }
+    //    catch (ObjectDisposedException)
+    //    {
+    //        Debug.Log("스트림이 닫혔습니다.");
+    //    }
+    //    catch (OperationCanceledException)
+    //    {
+    //        Debug.Log("Read 취소됨");
+    //    }
+    //    catch (Exception ex)
+    //    {
+    //        Debug.LogError($"수신 에러: {ex}");
+    //        MyNetworkManager.instance.SpawnErrorPrefab("ErrorPopup_Text002");
+    //        myNetworkManager.ActionQueue.Enqueue(
+    //            new Tuple<Action<PacketUtil>, PacketUtil>(myNetworkManager.ConnectServerFailed, null));
+    //    }
+    //}
+
+    private const int HeaderOffset = 4;          // 길이 헤더 크기
+
+    private async Task StartReadingAsync()
+    {
+        cancellationTokenSource = new CancellationTokenSource();
+        cancellationToken = cancellationTokenSource.Token;
+
+        try
+        {
+            while (!cancellationToken.IsCancellationRequested)
+            {
+                int headerRead = await ReadExactAsync(HeaderOffset, cancellationToken);
+                if (headerRead == 0) break; // 정상 종료
+
+                int bodySize = BitConverter.ToInt32(Buffer, 0);
+                if (bodySize <= 0 || bodySize > ClientSocket.PACKET_MAX_SIZE)
+                {
+                    Debug.LogError($"잘못된 패킷 크기: {bodySize}");
+                    break;
+                }
+
+                int bodyRead = await ReadExactAsync(bodySize, cancellationToken);
+                if (bodyRead == 0) break;
+
+                await ProcessPacketAsync(bodySize); // 내부에서는 Buffer[HeaderOffset..HeaderOffset+bodySize] 사용
+            }
+        }
+        catch (ObjectDisposedException)
+        {
+            Debug.Log("스트림이 닫혔습니다.");
+            ErrorPopup.EndGame = true; // 게임 종료 플래그 설정
+            MyNetworkManager.instance.SpawnErrorPrefab("ErrorPopup_Text002").Forget();
+            //myNetworkManager.ActionQueue.Enqueue(
+            //    new Tuple<Action<PacketUtil>, PacketUtil>(myNetworkManager.ConnectServerFailed, null));
+        }
+        catch (OperationCanceledException)
+        {
+            Debug.Log("Read 취소됨");
+            ErrorPopup.EndGame = true; // 게임 종료 플래그 설정
+            MyNetworkManager.instance.SpawnErrorPrefab("ErrorPopup_Text002").Forget();
+            //myNetworkManager.ActionQueue.Enqueue(
+            //    new Tuple<Action<PacketUtil>, PacketUtil>(myNetworkManager.ConnectServerFailed, null));
+        }
+        catch (Exception ex)
+        {
+            Debug.LogError($"수신 에러: {ex}");
+            //MyNetworkManager.instance.SpawnErrorPrefab("ErrorPopup_Text002");
+            myNetworkManager.ActionQueue.Enqueue(
+                new Tuple<Action<PacketUtil>, PacketUtil>(myNetworkManager.ConnectServerFailed, null));
+        }
+    }
+
+    /// <summary>
+    /// 정확히 <paramref name="size"/> 바이트를 읽어 Buffer[0..size-1]에 채운다.
+    /// 중간에 스트림이 끊기면 0 반환
+    /// </summary>
+    private async Task<int> ReadExactAsync(int size, CancellationToken token)
+    {
+        int totalRead = 0;
+        while (totalRead < size)
+        {
+            int read = await stream.ReadAsync(Buffer, totalRead, size - totalRead, token);
+            if (read == 0) return 0;     // 연결 종료
+            totalRead += read;
+        }
+        return totalRead;
+    }
+
+    public async Task StartListeningAsync()
+    {
+        cancellationToken = cancellationTokenSource.Token;
+
+        try
+        {
+            while (!cancellationToken.IsCancellationRequested && tcpClient.Connected)
+            {
+                int bytesRead = await stream.ReadAsync(Buffer, 0, Buffer.Length, cancellationToken);
+                await ProcessPacketAsync(bytesRead);
+            }
+        }
+        catch (OperationCanceledException e)
+        {
+            Debug.LogWarning($"Operation canceled: {e}");
+        }
+        catch (Exception ex)
+        {
+            Debug.LogError($"Exception: {ex}");
+            MyNetworkManager.instance.SpawnErrorPrefab("ErrorPopup_Text002").Forget();
+            myNetworkManager.ActionQueue.Enqueue(new Tuple<Action<PacketUtil>, PacketUtil>(myNetworkManager.ConnectServerFailed, null));
+        }
+    }
+
+    private Task ProcessPacketAsync(int size)
+    {
+        if (size > 0)
+        {
+            byte[] packet = new byte[size];
+            Array.Copy(Buffer, 0, packet, 0, size); // Adjust if necessary
+
+            PacketUtil pUtil = new PacketUtil(packet);
+            ClientSocket.HandlePacket(this, pUtil);
+        }
+        else
+        {
+            Debug.LogError("잘못된 패킷 크기: 받은 크기 0");
+            tcpClient.Close();
+        }
+
+        return Task.CompletedTask;
+    }
+
+
+    /// <summary>
+    /// header parsing method
+    /// </summary>
+    /// <param name="byteCode"></param>
+    /// <retruns></returns>
+    public static int GetInt(byte[] byteCode)
+    {
+        if (byteCode == null || byteCode.Length < 4)
+        {
+            throw new ArgumentException("Invalid byte array length for integer conversion");
+        }
+        int a1 = (byteCode[0] << 0);
+        int a2 = (byteCode[1] << 8);
+        int a3 = (byteCode[2] << 16);
+        int a4 = (byteCode[3] << 24);
+        return a1 + a2 + a3 + a4;
+    }
+
+    /// <summary>
+    /// data send method
+    /// </summary>
+    /// <param name="pUtil"></param>
+
+    public async UniTask SendAsync(PacketUtil pUtil, CancellationToken ct = default)
+    {
+        try
+        {
+            SendHandler header = GetHeader(GetInt(pUtil.GetBytes()));
+            byte[] data = pUtil.GetSendData();
+
+            await stream.WriteAsync(data, 0, data.Length, ct);
+            await stream.FlushAsync(ct);
+
+            //Debug.Log($"[Send] Header: {header}, Bytes: {data.Length}");
+        }
+        catch (OperationCanceledException)
+        {
+            Debug.LogWarning("SendAsync canceled.");
+        }
+        catch (IOException ioEx)
+        {
+            Debug.LogError($"IO error during send: {ioEx.Message}");
+        }
+        catch (Exception ex)
+        {
+            Debug.LogError($"SendAsync exception: {ex}");
+        }
+    }
+
+    /// <summary>
+    /// header return in Enum is parsing header
+    /// </summary>
+    /// <param name="header"></param>
+    /// <returns></returns>
+    public static SendHandler GetHeader(int header)
+    {
+        if (header == 0)
+        {
+            Debug.LogError("Invalid header");
+        }
+        foreach (SendHandler h in Enum.GetValues(typeof(SendHandler)))
+        {
+            if (((int)h) == header)
+            {
+                return h;
+            }
+        }
+        return SendHandler.Null;
+    }
+
+    /// <summary>
+    /// 멀티 워프 요청
+    /// </summary>
+    /// <param name="sceneName"></param>
+    //public void WarpSceneRequest(string sceneName = "CampusWorld")
+    public void WarpSceneRequest(string sceneName = Globals.SceneName.CampusWorld)
+    {
+        loadSceneName = sceneName;
+        beforeSceneName = LoadingData.nowScene;
+
+        UserCustomData.dictionaryChar.Clear();
+
+        var pUtil = new PacketUtil(SendHandler.WarpSceneRequest);
+        pUtil.SetString(id);
+        pUtil.SetString(beforeSceneName);
+        pUtil.SetString(loadSceneName);
+        SendAsync(pUtil).Forget();
+    }
+}
