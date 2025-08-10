@@ -1,0 +1,496 @@
+using CREALMirrorServ.DataBase;
+using CREALMirrorServ.Network;
+using CREALMirrorServ.Network.Handler;
+using CREALMirrorServ.Network.Server;
+using CREALMirrorServ.Util;
+using Newtonsoft.Json.Linq;
+using Npgsql.Replication.PgOutput.Messages;
+using System;
+using System.Buffers.Binary;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Drawing;
+using System.IO;
+using System.Net;
+using System.Net.Sockets;
+using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
+using static CREALMirrorServ.DataBase.DataBaseVO;
+using static System.Runtime.InteropServices.JavaScript.JSType;
+
+namespace CREALMirrorServ.Network.Client
+{
+    internal class GameClient
+    {
+        //통신 관련 정보
+        //public Socket socket;
+        public TcpClient socket;
+        public NetworkStream stream;
+        public IServer server;
+        public long lastPingTime;
+        public bool isAlive;
+        public bool isAllow;
+        public float currentTime = 0.0f;
+        public float timeLimit = 20.0f;
+
+        public string id;
+        public string nick;
+        public string context;
+        public string tsId;
+        public string div;
+        public int count = 0;
+        public int sp = 0;
+        public int candy = 0;
+
+        public DateTime startTime;
+        public DateTime endTime;
+        public static List<string> timeStempList = new List<string>();
+        public string userIP;
+        public string buildVersion = "0.159"; // fix me: Update 버전 변경 필요
+
+        public CharacterData charData;
+
+        public JsonUtil jsonUtil;
+        public static readonly object playerListLock = new object();
+        public static readonly object clientListLock = new object();
+        private CancellationTokenSource cancellationTokenSource = new CancellationTokenSource();
+        private CancellationToken cancellationToken;
+        public bool isTestDB = false;
+        public bool isBlockChain = false;
+        public string accessToken = string.Empty;
+        public string refreshToken = string.Empty;
+
+        public HttpClient ClientHttpClient { get; set; } = new HttpClient();
+        /// <summary>
+        /// 클라이언트 접속 시 새 클래스 선언
+        /// </summary>
+        /// <param name="socket"></param>
+        public GameClient(TcpClient client, NetworkStream networkStream)
+        {
+            this.socket = client;
+            this.stream = networkStream;
+            //this.stream.BeginRead(ServerSocket.Buffer, 0, ServerSocket.PACKET_MAX_SIZE, UserPacketReceived, this);
+
+            _ = Initialization();
+        }
+
+        private readonly byte[] _buf = new byte[4096];   // 고정 수신 버퍼
+        private bool _disposed;
+
+        /* 패킷·캐시 제한 */
+        private const int MaxPacket = 64 * 1024;          // 64 KB
+        private const int MaxCache = MaxPacket * 4;      // 256 KB
+
+        const int headerOffeset = 4; // 패킷 헤더 크기 (4 바이트)
+        public async Task StartReceivingAsync(CancellationToken ct)
+        {
+            int offset = 0;                               // 버퍼에 쌓인 길이
+
+            try
+            {
+                while (!ct.IsCancellationRequested || !cancellationTokenSource.Token.IsCancellationRequested)
+                {
+                    if (_disposed || !stream.CanRead) break;
+
+                    /* ① 소켓에서 읽기 */
+                    int read;
+                    try
+                    {
+                        read = await stream.ReadAsync(_buf.AsMemory(offset), ct)
+                                           .ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException) { break; }
+                    catch (IOException ioEx) when (ct.IsCancellationRequested || cancellationTokenSource.Token.IsCancellationRequested) { break; }
+                    catch (IOException ioEx) when (ioEx.InnerException is SocketException se &&
+                                                   (se.SocketErrorCode == SocketError.ConnectionReset ||
+                                                    se.SocketErrorCode == SocketError.OperationAborted ||
+                                                    (int)se.SocketErrorCode == 125))
+                    {
+                        LogSystem.LogWrite($"Socket closed by OS/cancel. {ioEx.InnerException} {ioEx.HResult}", LogType.Information);
+                        break;
+                    }
+                    if (read == 0) break;                 // 원격 종료
+                    offset += read;
+
+                    /* ② 버퍼에 패킷 1개 이상 모였는지 검사 */
+                    while (offset >= headerOffeset)                   // 헤더 4 바이트 이상
+                    {
+                        int packetLen = BinaryPrimitives.ReadInt32LittleEndian(_buf.AsSpan(0, headerOffeset));
+
+                        /* 길이 검증 */
+                        if (packetLen <= 0 || packetLen > MaxPacket)
+                        {
+                            LogSystem.LogWrite($"Illegal packet length {packetLen}", LogType.Error);
+                            await DisconnectAsync();     // 즉시 연결 종료
+                            return;
+                        }
+
+                        if (offset < headerOffeset + packetLen) break; // 아직 본문 부족 → 다음 Read 기다림
+
+                        /* ③ 패킷 추출 → 처리 */
+                        var packet = new byte[packetLen];
+                        _buf.AsSpan(headerOffeset, packetLen).CopyTo(packet);
+
+                        await ServerHandler.HandlePacket(this, new PacketUtil(packet));
+
+                        /* ④ 남은 데이터 앞으로 당기기 (메모리 이동 최소) */
+                        int remaining = offset - headerOffeset - packetLen;
+                        if (remaining > 0)
+                            _buf.AsSpan(headerOffeset + packetLen, remaining).CopyTo(_buf);
+                        offset = remaining;
+                    }
+
+                    /* ⑤ 캐시 폭주 방어 */
+                    if (offset > MaxCache)
+                    {
+                        LogSystem.LogWrite("Cache overflow – possible attack", LogType.Warning);
+                        await DisconnectAsync();
+                        return;
+                    }
+                }
+            }
+            catch (OperationCanceledException) { /* 정상 취소 */ }
+            catch (IOException ioEx) when (ioEx.InnerException is SocketException se &&
+                                           se.SocketErrorCode == SocketError.ConnectionReset)
+            {
+                LogSystem.LogWrite("Connection reset by peer", LogType.Warning);
+            }
+            catch (Exception ex)
+            {
+                LogSystem.LogWrite(ex.ToString(), LogType.Error);
+            }
+            finally
+            {
+                if (!_disposed)                            // 중복 Dispose 방지
+                {
+                    _disposed = true;
+                    try { stream.Close(); } catch { }
+                    try { socket.Close(); } catch { }
+                }
+            }
+        }
+
+        /// <summary>
+        /// 가공된 패킷을 클라이언트로 송신하는 함수.
+        /// </summary>
+        /// <param name="pUtil"></param>
+        private readonly SemaphoreSlim _sendLock = new(1);  // 동시 전송 방지용
+
+        public async Task SendAsync(PacketUtil pUtil, CancellationToken ct = default)
+        {
+            bool lockTaken = false;
+
+            try
+            {
+                await _sendLock.WaitAsync(ct);
+                lockTaken = true;
+
+                // ───────────────────────── stream 상태 확인 ─────────────────────────
+                if (stream == null || !stream.CanWrite)
+                {
+                    await DisconnectAsync();   // ← 여기!
+                    return;
+                }
+
+                var data = pUtil.GetSendData();
+
+                await stream.WriteAsync(data, 0, data.Length, ct);
+                // await stream.FlushAsync(ct);  // TCP라면 필요 없을 때가 더 많음
+
+                var header = GetHeader(ServerHandler.GetInt(pUtil.GetBytes()));
+                LogSystem.LogWrite($"{id} {nick} header - {header}");
+            }
+            catch (OperationCanceledException)
+            {
+                // 호출 측에서 취소한 경우 – 굳이 에러로 보지 않아도 됨
+            }
+            catch (ObjectDisposedException ex)
+            {
+                LogSystem.LogWrite($"Disposed: {ex.Message}", LogType.Warning);
+                await DisconnectAsync();
+            }
+            catch (IOException ex) when (ex.InnerException is SocketException se &&
+                                         (se.SocketErrorCode == SocketError.TimedOut ||
+                                          se.SocketErrorCode == SocketError.ConnectionReset))
+            {
+                LogSystem.LogWrite($"Socket {se.SocketErrorCode}: {ex.Message}", LogType.Warning);
+                await DisconnectAsync();
+            }
+            catch (Exception ex)
+            {
+                LogSystem.LogWrite($"Send error: {ex}", LogType.Error);
+                await DisconnectAsync();
+            }
+            finally
+            {
+                if (lockTaken) _sendLock.Release();
+            }
+        }
+
+        /// <summary>                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           
+        /// 파싱한 헤더를 Enum에서 찾아서 리턴
+        /// </summary>
+        /// <param name="header"></param>
+        /// <returns></returns>
+        public static SendHandler GetHeader(int header)
+        {
+            foreach (SendHandler h in Enum.GetValues(typeof(SendHandler)))
+            {
+                if (((int)h) == header)
+                {
+                    return h;
+                }
+            }
+            return SendHandler.Null;
+        }
+
+        /// <summary>
+        /// 유저 서버 접속 시 정상 접속 검증 체크 함수
+        /// </summary>
+        private async Task Initialization()
+        {
+            IPEndPoint remoteAddr = (IPEndPoint)socket.Client.RemoteEndPoint;
+            LogSystem.LogWrite("/" + remoteAddr.Address + "에서 새 유저가 서버에 접속을 시도했습니다.");
+            userIP = remoteAddr.Address.ToString();
+
+            var pUtil = new PacketUtil(SendHandler.ClientConnected);
+            pUtil.SetBool(true);
+
+            lastPingTime = GameUtil.CurrentTimeMillis();
+            isAlive = true;
+            jsonUtil = new JsonUtil();
+
+            await SendAsync(pUtil);
+            _ = StartHeartbeatAsync();
+        }
+
+        /// <summary>
+        /// 유저 접속 해제
+        /// </summary>
+        public async Task DisconnectAsync(bool closed = false, bool stop = false)
+        {
+            try
+            {
+                cancellationTokenSource.Cancel();
+
+                if (!closed)
+                {
+                    if (stop)
+                    {
+                        try
+                        {
+                            var pUtil = new PacketUtil(SendHandler.ClientConnected);
+                            pUtil.SetBool(false);
+                            await SendAsync(pUtil); // 안전하게 메시지 송신 시도
+                        }
+                        catch (Exception ex)
+                        {
+                            LogSystem.LogWrite($"Error sending disconnect notice: {ex.Message}", LogType.Warning);
+                        }
+                    }
+
+                    if (socket?.Client?.RemoteEndPoint is IPEndPoint remoteAddr)
+                    {
+                        LogSystem.LogWrite($"/{remoteAddr.Address} IP의 {id} 유저가 접속 종료했습니다.");
+                    }
+
+                    isAlive = false;
+                }
+
+                // 플레이어 리스트 정리
+                if (!string.IsNullOrEmpty(id) && server != null)
+                {
+                    lock (playerListLock)
+                    {
+                        var leave = new PacketUtil(SendHandler.LeaveSceneResult);
+                        leave.SetString(id);
+                        server.BroadcastMessage(leave, this, false);
+                        GameUtil.playerList.RemoveAll(p => p == this);
+                    }
+                }
+
+                if (!string.IsNullOrEmpty(id) && GameUtil.clientList.ContainsKey(id))
+                {
+                    lock (clientListLock)
+                    {
+                        if (GameUtil.clientList[id] == this)
+                            GameUtil.clientList.Remove(id);
+                    }
+                }
+
+                server?.RemoveUser(this);
+            }
+            catch (Exception e)
+            {
+                LogSystem.LogWrite($"Error during disconnection + id: {id} --- {e.Message}", LogType.Error);
+                lock (clientListLock)
+                {
+                    GameUtil.clientList.Remove(id);
+                }
+            }
+            finally
+            {
+                try { stream?.Close(); } catch { }
+                try { socket?.Close(); } catch { }
+
+                if (!string.IsNullOrEmpty(id))
+                {
+                    endTime = DateTime.Now;
+                    var duration = (endTime - startTime).ToString();
+                    LogSystem.LogWrite($"/{userIP} {id}, {nick}은 {duration}동안 있었습니다.");
+                    if (userIP != "114.203.110.85" && userIP != "58.233.53.150")
+                        timeStempList.Add($"/{userIP} {id}, {nick}은 {duration}동안 있었습니다.");
+                    else
+                        timeStempList.Add($"test/{userIP} {id}, {nick}은 {duration}동안 있었습니다.");
+
+                    lock (playerListLock)
+                    {
+                        GameUtil.playerList.Remove(this);
+                    }
+                }
+                if (!string.IsNullOrEmpty(tsId))
+                    _ = KickUserAsync(long.Parse(tsId));
+            }
+        }
+
+        public static List<string> GetAndClearTimeStempList()
+        {
+            List<string> tempList = new List<string>(timeStempList);
+            timeStempList.Clear();
+            return tempList;
+        }
+
+        /// <summary>
+        /// FCM토큰 전달
+        /// </summary>
+        public async void GetFCMToken(PacketUtil pUtil)
+        {
+            string fcmToken = pUtil.GetString();
+
+            var vo = new DataBaseVO.FCMTokenVO
+            {
+                tokenId = fcmToken,
+            };
+
+            JObject obj = await jsonUtil.GetJsonRequest("/api/v1/push/token", vo, this, "POST");
+
+            var sendUtil = new PacketUtil(SendHandler.FCMToken);
+            _ = SendAsync(sendUtil);
+        }
+
+        private CancellationTokenSource heartbeatTokenSource = new();
+        private const int HeartBeatTime = 900000;
+        public async Task StartHeartbeatAsync()
+        {
+            heartbeatTokenSource?.Cancel();
+            heartbeatTokenSource = new CancellationTokenSource();
+            CancellationToken token = heartbeatTokenSource.Token;
+
+            try
+            {
+                while (!token.IsCancellationRequested)
+                {
+                    if (!isAlive)
+                        break;
+
+                    long now = GameUtil.CurrentTimeMillis();
+                    if (now - lastPingTime >= HeartBeatTime)
+                    {
+                        LogSystem.LogWrite($"Heartbeat timeout for user {id}", LogType.Warning);
+                        await DisconnectAsync();
+                        break;
+                    }
+
+                    await Task.Delay(1000, token);
+                }
+            }
+            catch (TaskCanceledException) { }
+            catch (Exception ex)
+            {
+                LogSystem.LogWrite($"Heartbeat error: {ex.Message}", LogType.Error);
+            }
+        }
+
+        public void HeartbeatResult(PacketUtil pUtil)
+        {
+            lastPingTime = GameUtil.CurrentTimeMillis();
+            int val = (int)ReceiveHandler.Ping ^ GameUtil.MAGIC_NUM;
+
+            if (val != pUtil.GetInt())
+            {
+                _ = DisconnectAsync();
+            }
+        }
+
+        public void HeartbeatPause(PacketUtil pUtil)
+        {
+            isAlive = false;
+            _ = DisconnectAsync();
+        }
+
+
+        /// <summary>
+        /// 연결 초기화
+        /// </summary>
+        public async void RefreshConnect(PacketUtil pUtil)
+        {
+            var vo2 = new DataBaseVO.GetVO();
+
+            JObject obj2 = await jsonUtil.GetJsonRequest("/api/v1/auth/sessionCheck", vo2, this, "GET");
+        }
+
+        /// <summary>
+        /// 일시정지 했을 때 동작할 카운트다운함수
+        /// </summary>
+        public void CountDown()
+        {
+            while (!isAlive)
+            {
+                currentTime++;
+
+                if (currentTime > timeLimit)
+                {
+                    currentTime = 0.0f;
+                    isAlive = true;
+                }
+
+                Thread.Sleep(1000);
+            }
+        }
+
+        public void ShotDown()
+        {
+            cancellationTokenSource?.Cancel();
+            server.RemoveUser(this);
+            GameUtil.clientList.Remove(id);
+            heartbeatTokenSource?.Cancel();
+        }
+
+        static async Task<bool> KickUserAsync(long userId)
+        {
+            try
+            {
+                short port = ServerSocket.DebugPortKick;
+                if (ServerSocket.CurrentPort == ServerSocket.ReleasePortVN)
+                {
+                    port = ServerSocket.ReleasePortVNKick; // VN 서버 포트
+                }
+                else if(ServerSocket.CurrentPort == ServerSocket.ReleasePort)
+                {
+                    port = ServerSocket.ReleasePortKick; // KR 서버 포트
+                }
+                using var hc = new HttpClient { Timeout = TimeSpan.FromSeconds(10) };
+                var url = $"http://127.0.0.1:{port}/kick/user/{userId}";
+                var res = await hc.PostAsync(url, new StringContent(string.Empty));
+                LogSystem.LogWrite($"KickUserAsync {userId} result: {res.IsSuccessStatusCode}");
+                return res.IsSuccessStatusCode;
+            }
+            catch (Exception ex)
+            {
+                LogSystem.LogWrite($"KickUserAsync error: {ex.Message}", LogType.Error);
+                return false;
+            }
+        }
+    }
+}
