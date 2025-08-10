@@ -1,0 +1,136 @@
+using Cysharp.Threading.Tasks;
+using EnumTypes;
+using Nethereum.Contracts.Standards.ENS;
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.Linq;
+using System.Runtime.InteropServices.ComTypes;
+using System.Threading.Tasks;
+using UniRx;
+using UnityEngine;
+
+public class Roulette : UI_Popup
+{
+    public override bool IsFullScreenWindow { get; protected set; } = false;
+
+    [SerializeField]
+    private RouletteUI _currentRouletteUI;
+    [SerializeField]
+    private EventMark _currentNewMark;
+
+    [Header("Roulette Spin Setting")]
+    [SerializeField]
+    private Sprite[] _centerSprites;
+    [SerializeField]
+    private int _spinDuration;
+    [SerializeField]
+    private Transform _currentSpinningRoulette;
+    [SerializeField]
+    private AnimationCurve _spinningCurve;
+
+    private int _centerObjectIndex = 0;
+
+    bool isClick = false;
+
+    public override void Init()
+    {
+        _currentRouletteUI.RoluetteFinishText.gameObject.SetActive(false);
+        base.Init();
+        _currentRouletteUI.RouletteStartButton.onClick.AddListener(() =>
+        {
+            if (isClick)
+                return;
+
+            isClick = true;
+            _currentNewMark.CurrentState = false;
+            Spin();
+        });
+
+        Managers.RouletteMgr.RouletteCountData.rl_status.Subscribe(ButtonSetUP).AddTo(this);
+    }
+
+    public void ButtonSetUP(RouletteStatus rouletteStatus)
+    {
+        _currentRouletteUI.RouletteStartButton.gameObject.SetActive(false);
+
+        _currentRouletteUI.RouletteADButton.gameObject.SetActive(false);
+
+        _currentRouletteUI.RoluetteFinishText.gameObject.SetActive(false);
+
+        _currentNewMark.CurrentState = false;
+
+        if (rouletteStatus == RouletteStatus.Normal)
+        {
+            _currentNewMark.CurrentState = true;
+            _currentRouletteUI.RouletteStartButton.gameObject.SetActive(true);
+        }
+        else if (rouletteStatus == RouletteStatus.AD)
+            _currentRouletteUI.RouletteADButton.gameObject.SetActive(true);
+        else if (rouletteStatus == RouletteStatus.END)
+            _currentRouletteUI.RoluetteFinishText.gameObject.SetActive(true);
+    }
+
+    public void Spin()
+    {
+        _currentRouletteUI.CenterObject.sprite = _centerSprites[_centerObjectIndex]; // magic number
+
+        Managers.RouletteMgr.SetSelectIndex();
+
+        float angle = Managers.RouletteMgr.PieceAngle * Managers.RouletteMgr.selectIndex;
+
+        float leftOffset = angle;
+        float rightOffset = Managers.RouletteMgr.PieceAngle * (Managers.RouletteMgr.selectIndex + 1);
+        float randomAngle = UnityEngine.Random.Range(leftOffset, rightOffset);
+
+        int rotateSpeed = 2;
+        float targetAngle = (randomAngle + 360 * _spinDuration * rotateSpeed);
+
+        OnSpin(targetAngle).Forget();
+    }
+
+    private async UniTask OnSpin(float end)
+    {
+        float current = 0;
+        float percent = 0;
+
+        while (percent < 1)
+        {
+            current += Time.deltaTime;
+            percent = current / _spinDuration;
+
+            float z = Mathf.Lerp(0, end, _spinningCurve.Evaluate(percent));
+            _currentSpinningRoulette.rotation = Quaternion.Euler(0, 0, z);
+
+            await UniTask.Yield();
+        }
+
+        _currentRouletteUI.RewardPanel.SetActive(true);
+
+        Managers.RouletteMgr.SaveTodayRouletteRequest();
+
+        if (Managers.RouletteMgr.GetCopyRandomItme().ItemType == Award.Sp)
+        {
+            _currentRouletteUI.ItemIcon.sprite = await Managers.AddressalbeMgr.LoadAssetByKeyAsync<Sprite>("Icon_SP");
+            _currentRouletteUI.ItemName.text = $"{Managers.RouletteMgr.GetCopyRandomItme().ItemAmount} SP";
+        }
+        else if (Managers.RouletteMgr.GetCopyRandomItme().ItemType == Award.SpecialItem)
+        {
+            _currentRouletteUI.ItemIcon.sprite = Managers.RouletteMgr.GetSpecialItem().ItemSprite;
+            _currentRouletteUI.ItemName.text = Managers.RouletteMgr.GetSpecialItem().ItemDisplayName;
+            _currentRouletteUI.ItemName.fontSize = 66;
+            _currentRouletteUI.ItemName.lineSpacing = 1f;
+        }
+        else
+        {
+            _currentRouletteUI.ItemIcon.sprite = Managers.RouletteMgr.GetCopyRandomItme().ItemSprite;
+            _currentRouletteUI.ItemName.text = Managers.RouletteMgr.GetCopyRandomItme().ItemDisplayName;
+            _currentRouletteUI.ItemName.fontSize = 66;
+            _currentRouletteUI.ItemName.lineSpacing = 1f;
+        }
+
+        _currentRouletteUI.CenterObject.sprite = _centerSprites[_centerObjectIndex];
+
+        isClick = false;
+    }
+}
