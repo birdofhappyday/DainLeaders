@@ -132,14 +132,10 @@ public class BuildScript
             return;
         }
 
-        int buildNumber = 0;
+        int buildNumber = GetSubtargetNumber(target, isServer, region);
 
         // 플랫폼별 세부 설정
-        if (target == BuildTarget.StandaloneWindows64 || target == BuildTarget.StandaloneLinux64)
-        {
-            buildNumber = isServer ? (int)StandaloneBuildSubtarget.Server : (int)StandaloneBuildSubtarget.Player;
-        }
-        else
+        if (target == BuildTarget.Android)
         {
             EditorUserBuildSettings.buildAppBundle = false;
             PlayerSettings.Android.useCustomKeystore = true;
@@ -157,9 +153,8 @@ public class BuildScript
                 PlayerSettings.Android.keyaliasName = ANDROID_Keyalias_Name_VN;
                 PlayerSettings.Android.keyaliasPass = ANDROID_Keystore_Pass;
             }
-
-            buildNumber = 0;
         }
+
         // 4. 빌드 옵션 설정
         var buildPlayerOptions = new BuildPlayerOptions
         {
@@ -323,6 +318,20 @@ public class BuildScript
         if (Directory.Exists(folder))
         {
             Process.Start("explorer.exe", folder.Replace("/", "\\"));
+        }
+    }
+
+    private static int GetSubtargetNumber(BuildTarget target, bool isServer, BuildRegion region)
+    {
+        switch (target)
+        {
+            case BuildTarget.StandaloneWindows64:
+            case BuildTarget.StandaloneLinux64:
+                return isServer ? (int)StandaloneBuildSubtarget.Server : (int)StandaloneBuildSubtarget.Player;
+            case BuildTarget.Android:
+                return 0;
+            default:
+                return 0;
         }
     }
 
