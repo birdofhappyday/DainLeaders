@@ -134,6 +134,7 @@ public class BuildScript
 
         int buildNumber = 0;
 
+        // 플랫폼별 세부 설정
         if (target == BuildTarget.StandaloneWindows64 || target == BuildTarget.StandaloneLinux64)
         {
             buildNumber = isServer ? (int)StandaloneBuildSubtarget.Server : (int)StandaloneBuildSubtarget.Player;
@@ -168,11 +169,6 @@ public class BuildScript
             options = BuildOptions.CompressWithLz4HC,
             subtarget = buildNumber,
         };
-
-        // 플랫폼별 세부 설정
-        if (target == BuildTarget.Android)
-        {
-        }
 
         // 5. 빌드 실행
         UnityEngine.Debug.Log($"Starting build for {target} ({type}, {region}) to {locationPathName}");
