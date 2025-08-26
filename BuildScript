@@ -1,0 +1,334 @@
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
+using System.Linq;
+using UnityEditor;
+using UnityEditor.Build;
+using UnityEditor.Build.Reporting;
+using UnityEditor.SceneManagement;
+using UnityEngine.SceneManagement;
+
+public class BuildScript
+{
+    // 빌드 설정을 위한 상수 정의
+    private const string VIETNAM_SYMBOL = "VIETNAM";
+    private static readonly string[] CLIENT_SCENES = { "Assets/Scenes/Share/InitializeScene.unity", "Assets/Scenes/Share/AdditiveMainScene.unity" };
+    private static readonly string[] BASE_SERVER_SCENES = { "Assets/Scenes/Share/InitializeScene.unity", "Assets/Scenes/Share/LoginScene.unity", "Assets/Scenes/Share/AvatarScene.unity", "Assets/Scenes/Share/AdditiveMainScene.unity" };
+
+    // 빌드 타입을 구분하기 위한 Enum
+    private enum BuildType { Client, Server }
+    private enum BuildRegion { Korea, Vietnam }
+
+    #region MenuItem Definitions (Build)
+
+    [MenuItem("Build/Client/Build Android (Korea)")]
+    public static void BuildAndroidClient() => PerformBuild(BuildTarget.Android, BuildType.Client, BuildRegion.Korea, "Builds/Android/Client.apk");
+
+    [MenuItem("Build/Client/Build Android (Vietnam)")]
+    public static void BuildAndroidVNClient() => PerformBuild(BuildTarget.Android, BuildType.Client, BuildRegion.Vietnam, "Builds/Android/Client_VN.apk");
+
+    [MenuItem("Build/Client/Build Windows (Korea)")]
+    public static void BuildWindowsClient() => PerformBuild(BuildTarget.StandaloneWindows64, BuildType.Client, BuildRegion.Korea, "Builds/Windows/Client/Client.exe");
+
+    [MenuItem("Build/Client/Build Windows (Vietnam)")]
+    public static void BuildWindowsVNClient() => PerformBuild(BuildTarget.StandaloneWindows64, BuildType.Client, BuildRegion.Vietnam, "Builds/Windows/Client/Client_VN.exe");
+
+    [MenuItem("Build/Server/Build Windows (Korea)")]
+    public static void BuildWindowsServer() => PerformBuild(BuildTarget.StandaloneWindows64, BuildType.Server, BuildRegion.Korea, "Builds/Windows/Server/Server.exe");
+
+    [MenuItem("Build/Server/Build Windows (Vietnam)")]
+    public static void BuildWindowsServerVN() => PerformBuild(BuildTarget.StandaloneWindows64, BuildType.Server, BuildRegion.Vietnam, "Builds/Windows/Server/Server_VN.exe");
+
+    [MenuItem("Build/Server/Build Linux (Korea)")]
+    public static void BuildLinuxServer() => PerformBuild(BuildTarget.StandaloneLinux64, BuildType.Server, BuildRegion.Korea, "Builds/Linux/Server/Server.x86_64");
+
+    [MenuItem("Build/Server/Build Linux (Vietnam)")]
+    public static void BuildLinuxServerVN() => PerformBuild(BuildTarget.StandaloneLinux64, BuildType.Server, BuildRegion.Vietnam, "Builds/Linux/Server/Server_VN.x86_64");
+
+    // 테스트용 단일 씬 빌드
+    [MenuItem("Build/Build Current Scene (Android)")]
+    public static void BuildAndroidCurrentScene()
+    {
+        var activeScene = SceneManager.GetActiveScene();
+        if (string.IsNullOrEmpty(activeScene.path))
+        {
+            UnityEngine.Debug.LogError("Current scene is not saved. Please save the scene first.");
+            return;
+        }
+
+        EditorBuildSettings.scenes = new[] { new EditorBuildSettingsScene(activeScene.path, true) };
+
+        var buildOptions = new BuildPlayerOptions
+        {
+            scenes = new[] { activeScene.path },
+            locationPathName = "Builds/Android/Android_Test.apk",
+            target = BuildTarget.Android,
+            options = BuildOptions.CompressWithLz4HC
+        };
+
+        EditorUserBuildSettings.buildAppBundle = false;
+        PlayerSettings.Android.useCustomKeystore = false;
+
+        BuildReport report = BuildPipeline.BuildPlayer(buildOptions);
+        if (report.summary.result == BuildResult.Succeeded)
+        {
+            OpenFolder(report.summary.outputPath);
+        }
+    }
+
+    #endregion
+
+    #region MenuItem Definitions (Change Platform)
+
+    [MenuItem("Build/Client/Change To Android (Korea)")]
+    public static void ChangeAndroidClient() => PerformBuild(BuildTarget.Android, BuildType.Client, BuildRegion.Korea, null, true);
+
+    [MenuItem("Build/Client/Change To Android (Vietnam)")]
+    public static void ChangeAndroidVNClient() => PerformBuild(BuildTarget.Android, BuildType.Client, BuildRegion.Vietnam, null, true);
+
+    [MenuItem("Build/Client/Change To Windows (Korea)")]
+    public static void ChangeWindowsClient() => PerformBuild(BuildTarget.StandaloneWindows64, BuildType.Client, BuildRegion.Korea, null, true);
+
+    [MenuItem("Build/Client/Change To Windows (Vietnam)")]
+    public static void ChangeWindowsVNClient() => PerformBuild(BuildTarget.StandaloneWindows64, BuildType.Client, BuildRegion.Vietnam, null, true);
+
+    [MenuItem("Build/Server/Change To Windows (Korea)")]
+    public static void ChangeWindowsServer() => PerformBuild(BuildTarget.StandaloneWindows64, BuildType.Server, BuildRegion.Korea, null, true);
+
+    [MenuItem("Build/Server/Change To Windows (Vietnam)")]
+    public static void ChangeWindowsServerVN() => PerformBuild(BuildTarget.StandaloneWindows64, BuildType.Server, BuildRegion.Vietnam, null, true);
+
+    [MenuItem("Build/Server/Change To Linux (Korea)")]
+    public static void ChangeLinuxServer() => PerformBuild(BuildTarget.StandaloneLinux64, BuildType.Server, BuildRegion.Korea, null, true);
+
+    [MenuItem("Build/Server/Change To Linux (Vietnam)")]
+    public static void ChangeLinuxServerVN() => PerformBuild(BuildTarget.StandaloneLinux64, BuildType.Server, BuildRegion.Vietnam, null, true);
+
+    #endregion
+
+    /// <summary>
+    /// 중앙 빌드 처리 메소드
+    /// </summary>
+    private static void PerformBuild(BuildTarget target, BuildType type, BuildRegion region, string locationPathName, bool onlySwitchPlatform = false)
+    {
+        bool isServer = type == BuildType.Server;
+
+        // 1. Define Symbol 설정
+        var namedBuildTarget = isServer ? NamedBuildTarget.Server : NamedBuildTarget.FromBuildTargetGroup(BuildPipeline.GetBuildTargetGroup(target));
+        SetDefineSymbol(VIETNAM_SYMBOL, region == BuildRegion.Vietnam, namedBuildTarget);
+
+        // 2. 씬 목록 설정
+        string[] scenesToBuild = GetScenesForBuild(type, region);
+        EditorBuildSettings.scenes = scenesToBuild.Select(path => new EditorBuildSettingsScene(path, true)).ToArray();
+
+        // 3. 플랫폼 전환
+        SwitchToPlatform(target, isServer);
+
+        // 플랫폼 전환만 하는 경우 여기서 종료
+        if (onlySwitchPlatform)
+        {
+            UnityEngine.Debug.Log($"Switched platform to {target} ({type}, {region})");
+            return;
+        }
+
+        int buildNumber = 0;
+
+        if (target == BuildTarget.StandaloneWindows64 || target == BuildTarget.StandaloneLinux64)
+        {
+            buildNumber = isServer ? (int)StandaloneBuildSubtarget.Server : (int)StandaloneBuildSubtarget.Player;
+        }
+        else
+        {
+            EditorUserBuildSettings.buildAppBundle = false;
+            PlayerSettings.Android.useCustomKeystore = true;
+            if (region == BuildRegion.Korea)
+            {
+                PlayerSettings.Android.keystoreName = ANDROID_Keystore_Name_KR;
+                PlayerSettings.Android.keystorePass = ANDROID_Keystore_Pass;
+                PlayerSettings.Android.keyaliasName = ANDROID_Keyalias_Name_KR;
+                PlayerSettings.Android.keyaliasPass = ANDROID_Keystore_Pass;
+            }
+            else if (region == BuildRegion.Vietnam)
+            {
+                PlayerSettings.Android.keystoreName = ANDROID_Keystore_Name_VN;
+                PlayerSettings.Android.keystorePass = ANDROID_Keystore_Pass;
+                PlayerSettings.Android.keyaliasName = ANDROID_Keyalias_Name_VN;
+                PlayerSettings.Android.keyaliasPass = ANDROID_Keystore_Pass;
+            }
+
+            buildNumber = 0;
+        }
+        // 4. 빌드 옵션 설정
+        var buildPlayerOptions = new BuildPlayerOptions
+        {
+            scenes = scenesToBuild,
+            locationPathName = locationPathName,
+            target = target,
+            options = BuildOptions.CompressWithLz4HC,
+            subtarget = buildNumber,
+        };
+
+        // 플랫폼별 세부 설정
+        if (target == BuildTarget.Android)
+        {
+        }
+
+        // 5. 빌드 실행
+        UnityEngine.Debug.Log($"Starting build for {target} ({type}, {region}) to {locationPathName}");
+        BuildReport report = BuildPipeline.BuildPlayer(buildPlayerOptions);
+        BuildSummary summary = report.summary;
+
+        // 6. 결과 처리
+        if (summary.result == BuildResult.Succeeded)
+        {
+            UnityEngine.Debug.Log($"Build successful! Output: {summary.outputPath}");
+            OpenFolder(summary.outputPath);
+        }
+        else
+        {
+            UnityEngine.Debug.LogError($"Build failed with result: {summary.result}");
+        }
+    }
+
+    #region Helper Methods
+
+    /// <summary>
+    /// 빌드 타입과 지역에 맞는 씬 목록을 반환합니다.
+    /// </summary>
+    private static string[] GetScenesForBuild(BuildType type, BuildRegion region)
+    {
+        if (type == BuildType.Client)
+        {
+            return CLIENT_SCENES;
+        }
+
+        // 서버 빌드 씬 설정
+        var sceneList = new HashSet<string>(BASE_SERVER_SCENES);
+
+        // 현재 열려있는 씬 상태를 저장
+        string originalScenePath = SceneManager.GetActiveScene().path;
+        var sceneSetup = EditorSceneManager.GetSceneManagerSetup();
+
+        try
+        {
+            var serverScenesFromManager = GetServerScenesFromManager(region);
+            foreach (var scene in serverScenesFromManager)
+            {
+                sceneList.Add(scene);
+            }
+        }
+        catch (Exception e)
+        {
+            UnityEngine.Debug.LogError($"Failed to get server scenes from MyNetworkManager. Error: {e.Message}");
+        }
+        finally
+        {
+            // 작업 후 원래 씬으로 복구
+            if (!string.IsNullOrEmpty(originalScenePath))
+            {
+                EditorSceneManager.RestoreSceneManagerSetup(sceneSetup);
+            }
+        }
+
+        return sceneList.ToArray();
+    }
+
+    /// <summary>
+    /// MyNetworkManager에서 서버 씬 목록을 가져옵니다.
+    /// </summary>
+    private static List<string> GetServerScenesFromManager(BuildRegion region)
+    {
+        const string initializeScenePath = "Assets/Scenes/Share/InitializeScene.unity";
+        var scene = EditorSceneManager.OpenScene(initializeScenePath, OpenSceneMode.Single);
+
+        // MyNetworkManager를 찾습니다.
+        var networkManager = UnityEngine.Object.FindObjectsByType<MyNetworkManager>(UnityEngine.FindObjectsInactive.Include, UnityEngine.FindObjectsSortMode.None).FirstOrDefault();
+        if (networkManager == null)
+        {
+            throw new Exception($"MyNetworkManager component not found in {initializeScenePath}.");
+        }
+
+        var resultScenePaths = new List<string>();
+
+        // 기본 추가 씬
+        foreach (var sceneName in networkManager.additiveScenes)
+        {
+            resultScenePaths.Add($"Assets/Scenes/Share/{sceneName}.unity");
+        }
+
+        // 지역별 추가 씬
+        var regionScenes = (region == BuildRegion.Vietnam) ? networkManager.additiveScenes_VI : networkManager.additiveScenes_KO;
+        string regionPath = (region == BuildRegion.Vietnam) ? "Assets/Scenes/VN" : "Assets/Scenes/KO";
+
+        foreach (var sceneName in regionScenes)
+        {
+            resultScenePaths.Add(Path.Combine(regionPath, $"{sceneName}.unity"));
+        }
+
+        return resultScenePaths;
+    }
+
+
+    /// <summary>
+    /// 지정된 스크립팅 디파인 심볼을 설정하거나 해제합니다.
+    /// </summary>
+    public static void SetDefineSymbol(string symbol, bool shouldExist, NamedBuildTarget targetGroup)
+    {
+        string currentSymbols = PlayerSettings.GetScriptingDefineSymbols(targetGroup);
+        var symbolsList = new HashSet<string>(currentSymbols.Split(';').Where(s => !string.IsNullOrWhiteSpace(s)));
+
+        bool changed = false;
+        if (shouldExist && !symbolsList.Contains(symbol))
+        {
+            symbolsList.Add(symbol);
+            changed = true;
+        }
+        else if (!shouldExist && symbolsList.Contains(symbol))
+        {
+            symbolsList.Remove(symbol);
+            changed = true;
+        }
+
+        if (changed)
+        {
+            string updatedSymbols = string.Join(";", symbolsList);
+            PlayerSettings.SetScriptingDefineSymbols(targetGroup, updatedSymbols);
+            UnityEngine.Debug.Log($"Define symbols for {targetGroup} updated: {updatedSymbols}");
+        }
+    }
+
+    /// <summary>
+    /// 빌드 타겟 플랫폼으로 전환합니다.
+    /// </summary>
+    public static void SwitchToPlatform(BuildTarget targetPlatform, bool asServer = false)
+    {
+        NamedBuildTarget named = asServer ? NamedBuildTarget.Server : NamedBuildTarget.FromBuildTargetGroup(BuildPipeline.GetBuildTargetGroup(targetPlatform));
+
+        var currentTarget = EditorUserBuildSettings.activeBuildTarget;
+        var currentSubTarget = EditorUserBuildSettings.standaloneBuildSubtarget;
+        var desiredSubTarget = asServer ? StandaloneBuildSubtarget.Server : StandaloneBuildSubtarget.Player;
+
+        if (currentTarget == targetPlatform && currentSubTarget == desiredSubTarget)
+        {
+            return; // 이미 올바른 플랫폼이므로 전환하지 않음
+        }
+
+        EditorUserBuildSettings.standaloneBuildSubtarget = desiredSubTarget;
+        EditorUserBuildSettings.SwitchActiveBuildTarget(named, targetPlatform);
+    }
+
+    /// <summary>
+    /// 빌드 완료 후 결과 폴더를 엽니다.
+    /// </summary>
+    private static void OpenFolder(string path)
+    {
+        string folder = Path.GetDirectoryName(path);
+        if (Directory.Exists(folder))
+        {
+            Process.Start("explorer.exe", folder.Replace("/", "\\"));
+        }
+    }
+
+    #endregion
+}
